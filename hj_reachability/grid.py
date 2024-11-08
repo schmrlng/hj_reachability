@@ -1,6 +1,7 @@
 import functools
 
 from flax import struct
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -20,19 +21,15 @@ class Grid:
     """Class for representing Cartesian state grids with uniform spacing in each dimension.
 
     Attributes:
-        states: An `(N + 1)` dimensional array containing the state values at each grid location. The first `N`
-            dimensions correspond to the location in the grid, while the last dimension (itself of size `N`) contains
-            the state vector.
         domain: A `Box` representing the domain of grid.
         coordinate_vectors: A tuple of `N` arrays containing the discrete state values in each dimension. The `states`
-            attribute is produced by `stack`ing a `meshgrid` of these coordinate vectors.
+            property is produced by `stack`ing a `meshgrid` of these coordinate vectors.
         spacings: A tuple of `N` scalars containing the grid spacing (the difference between successive elements of the
             corresponding coordinate vector) in each dimension.
         boundary_conditions: A tuple of `N` boundary conditions for each dimension. These boundary conditions are
             functions used to pad values (notably not stored in this `Grid` data structure) to implement a boundary
             condition (e.g., periodic).
     """
-    states: Array
     domain: sets.Box
     coordinate_vectors: Tuple[Array, ...]
     spacings: Tuple[Array, ...]
@@ -70,37 +67,56 @@ class Grid:
         coordinate_vectors, spacings = zip(
             *(jnp.linspace(l, h, n, endpoint=bc is not _boundary_conditions.periodic, retstep=True)
               for l, h, n, bc in zip(domain.lo, domain.hi, shape, boundary_conditions)))
-        states = jnp.stack(jnp.meshgrid(*coordinate_vectors, indexing="ij"), -1)
 
-        return cls(states, domain, coordinate_vectors, spacings, boundary_conditions)
+        return cls(domain, coordinate_vectors, spacings, boundary_conditions)
+
+    @property
+    def states(self) -> Array:
+        """Returns the states represented by the `Grid` object.
+
+        Returns:
+            An `(N + 1)` dimensional array containing the state values at each grid location. The first `N` dimensions
+            correspond to the location in the grid, while the last dimension (itself of size `N`) contains the state
+            vector.
+        """
+        return jnp.stack(jnp.meshgrid(*self.coordinate_vectors, indexing="ij"), -1)
 
     @property
     def ndim(self) -> int:
         """Returns the dimension `N` of the grid."""
-        return self.states.ndim - 1
+        return len(self.coordinate_vectors)
 
     @property
     def shape(self) -> Tuple[int, ...]:
         """Returns the shape of the grid, a tuple of `N` integers."""
-        return self.states.shape[:-1]
+        return tuple(v.size for v in self.coordinate_vectors)
 
-    def upwind_grad_values(self, upwind_scheme: Callable, values: Array) -> Tuple[Array, Array]:
-        """Returns `(left_grad_values, right_grad_values)`."""
-        left_derivatives, right_derivatives = zip(*[
-            utils.multivmap(lambda values: upwind_scheme(values, spacing, boundary_condition),
-                            np.array([j
-                                      for j in range(self.ndim)
-                                      if j != i]))(values)
-            for i, (spacing, boundary_condition) in enumerate(zip(self.spacings, self.boundary_conditions))
-        ])
+    def map_over_states(self, fun: Callable, state_as_tuple: bool = False) -> Callable:
+        """Creates a function which maps `fun` over all states in the grid."""
+        fun_packed = lambda state, args, kwargs: fun(state if state_as_tuple else jnp.array(state), *args, **kwargs)
+        return lambda *args, **kwargs: (functools.reduce(
+            lambda f, i_x: jax.vmap(f, (tuple(i_x[1]), i_x[0], i_x[0]), i_x[0]),
+            enumerate(np.where(np.eye(self.ndim), 0, None)), fun_packed)(self.coordinate_vectors, args, kwargs))
+
+    def upwind_partial_derivatives(self, values: Array, axis: int, upwind_scheme: Callable) -> Tuple[Array, Array]:
+        """Returns `(left_partial_derivatives, right_partial_derivatives)` corresponding to `axis`."""
+        spacing = self.spacings[axis]
+        boundary_condition = self.boundary_conditions[axis]
+        return utils.multivmap(lambda v: upwind_scheme(v, spacing, boundary_condition),
+                               np.array([i for i in range(self.ndim) if i != axis]))(values)
+
+    def upwind_gradients(self, values: Array, upwind_scheme: Callable) -> Tuple[Array, Array]:
+        """Returns `(left_gradients, right_gradients)`."""
+        left_derivatives, right_derivatives = zip(
+            *[self.upwind_partial_derivatives(values, axis, upwind_scheme) for axis in range(self.ndim)])
         return (jnp.stack(left_derivatives, -1), jnp.stack(right_derivatives, -1))
 
-    def grad_values(self, values: Array, upwind_scheme: Optional[Callable] = None) -> Array:
-        """Returns a central difference-based approximation of `grad_values`."""
+    def gradients(self, values: Array, upwind_scheme: Optional[Callable] = None) -> Array:
+        """Returns a central difference-based approximation of the gradients of `values`."""
         # TODO: Implement central difference schemes in `hj_reachability.finite_differences`.
         if upwind_scheme is None:
             upwind_scheme = upwind_first.first_order
-        return sum(self.upwind_grad_values(upwind_scheme, values)) / 2
+        return sum(self.upwind_gradients(values, upwind_scheme)) / 2
 
     def position(self, state: Array) -> Array:
         """Returns an array of `float`s corresponding to the position of `state` in the grid."""

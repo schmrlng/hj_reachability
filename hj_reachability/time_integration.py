@@ -18,15 +18,20 @@ def lax_friedrichs_numerical_hamiltonian(hamiltonian, state, time, value, left_g
 def euler_step(solver_settings, dynamics, grid, time, values, time_step=None, max_time_step=None):
     time_direction = jnp.sign(max_time_step) if time_step is None else jnp.sign(time_step)
     signed_hamiltonian = lambda *args, **kwargs: time_direction * dynamics.hamiltonian(*args, **kwargs)
-    left_grad_values, right_grad_values = grid.upwind_grad_values(solver_settings.upwind_scheme, values)
-    dissipation_coefficients = solver_settings.artificial_dissipation_scheme(dynamics.partial_max_magnitudes,
-                                                                             grid.states, time, values,
-                                                                             left_grad_values, right_grad_values)
+    left_grad_values, right_grad_values = grid.upwind_gradients(values, solver_settings.upwind_scheme)
+    dissipation_coefficients = solver_settings.artificial_dissipation_scheme(dynamics.partial_max_magnitudes, grid,
+                                                                             time, values, left_grad_values,
+                                                                             right_grad_values)
     dvalues_dt = -solver_settings.hamiltonian_postprocessor(time_direction * utils.multivmap(
         lambda state, value, left_grad_value, right_grad_value, dissipation_coefficients:
         (lax_friedrichs_numerical_hamiltonian(signed_hamiltonian, state, time, value,
                                               left_grad_value, right_grad_value, dissipation_coefficients)),
         np.arange(grid.ndim))(grid.states, values, left_grad_values, right_grad_values, dissipation_coefficients))
+    # dvalues_dt = -solver_settings.hamiltonian_postprocessor(time_direction * grid.map_over_states(
+    #     lambda state, value, left_grad_value, right_grad_value, dissipation_coefficients:
+    #     (lax_friedrichs_numerical_hamiltonian(signed_hamiltonian, state, time, value, left_grad_value, right_grad_value,
+    #                                           dissipation_coefficients)))(values, left_grad_values, right_grad_values,
+    #                                                                       dissipation_coefficients))
     if time_step is None:
         time_step_bound = 1 / jnp.max(jnp.sum(dissipation_coefficients / jnp.array(grid.spacings), -1))
         time_step = time_direction * jnp.minimum(solver_settings.CFL_number * time_step_bound, jnp.abs(max_time_step))
